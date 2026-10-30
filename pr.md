@@ -12,14 +12,12 @@
 
 librime 的自动恢复只挂在"会话挂载方案词典"（`UserDictionary::Load()`）这一条路径上。当 db 从不挂载、只被依赖组件打开时，恢复永远不会触发，日志会不断刷错。
 
-本案例：`moran_pin.userdb` 损坏于 2026-06-04。它不在 schema_list 里，只被 moran_fixed/moran_aux 的 lua 组件打开，每个会话失败 3 次、刷 3 条 ERROR，单日累计 237 条，四个月没触发过一次修复。
+本案例：`moran_pin.userdb` 不在 schema_list 里，只被 moran_fixed/moran_aux 的 lua 组件打开，每个会话失败 3 次、刷 3 条 ERROR，单日累计 237 条，四个月没触发过一次修复。
 
-修复方式应当二选一：
+修复方式二选一：
 
 - **方案 A（本 PR）**：`Open()` 失败且 `IsCorruption()` 时自动 RepairDB 修复并重试。db 层生效，覆盖所有调用方，数据能救回，日志只剩一条 WARNING；
 - **方案 B**：不修，但每个会话只报一次错（或静默跳过）。数据仍然不可用。
-
-现状（反复重试 + 反复刷错）不可接受。本 PR 实现的是 A。
 
 ---
 
@@ -33,7 +31,7 @@ fix(level_db): try to recover corrupted user db on open failure
 
 ---
 
-## 背景：一个真实损坏案例
+## 详细情况
 
 - 环境：Windows 11 x64，小狼毫 beta 构建（二进制 2026-10-12 打包、2026-10-21 安装，版本资源 0.17.4.0）
 - `moran_pin.userdb`（明月拼音·简化字）自 **2026-06-04** 起无法打开，glog 每个会话重复刷同一条 ERROR（实测单会话 168→237 条并随使用持续增长），该词典用户数据完全不可用，界面无任何提示：
@@ -84,7 +82,14 @@ E20261029 18:05:02.xxx 16208 level_db.cc:259] Error opening db 'moran_pin': Corr
 3. **修复失败不自动删库**：改名隔离 + 重建 + 快照还原的完整链路已在 `UserDbRecoveryTask` 中存在，是否在维护/部署流程中接线该任务留作开放问题（见下）；
 4. 行为变化对用户可见的效果：损坏的 userdb 在下一次打开时自动被 RepairDB 修复，数据尽量保留，日志从"每会话数百条 ERROR"变为一条 WARNING（修复成功时）。
 
-## 希望维护者关注的几个发现（开放问题）
+
+
+
+
+----
+
+
+## 希望维护者关注的几个发现（开放问题）      让ai调试的时候ta提的问题，我没看也看不懂，顺带附上了
 
 1. **恢复接线只覆盖会话挂载路径**：`userdb_recovery_task` 由 `UserDictionary::Load()` 触发，不挂载的 userdb（如本案例的 moran_pin）够不着。本 PR 在 Open 层补上缺口；要不要再加维护期全量巡检，留待讨论；
 2. **`LevelDb` 没有任何 `RIME_DLL` 导出标注**（对比 `TextDb` 全量标注）：Windows 上无法直接实例化测试。尝试对齐 TextDb 风格逐方法标注后，MinGW 链接仍失败——`LevelDb` 多继承 `Recoverable`/`Transactional`，按方法 dllexport 导不出 secondary-base 的 `non-virtual thunk`（`non-virtual thunk to rime::LevelDb::Recover()` 等 undefined reference）；`TextDb` 能直接实例化是因为它单继承。本 PR 的测试因此走组件 + 虚调用（头文件零改动）。若希望 LevelDb 可直接实例化测试，可能需要类级导出或对 `UserDbWrapper<LevelDb>` 显式实例化导出，请维护者定夺；
