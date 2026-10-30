@@ -106,7 +106,7 @@ E20261029 18:05:02.xxx 16208 level_db.cc:259] Error opening db 'moran_pin': Corr
 - `repair_validation.txt`（WSL 对真实损坏副本的验证记录）
 - `rime_test_final.log`（校机 146 绿）
 - `rime_test_stress2.log`（校机 151 绿，含压力用例与 `[stress]` 观察输出）
-- 损坏的 `moran_pin.userdb.zip`（供维护者复现：解包放入用户目录即可）
+- 匿名化的 `moran_pin.userdb.anon.zip`（复现样本：`user_id` 与用户词条已删除，保留"悬空 CURRENT + 新 MANIFEST 在场无引用"的现场结构，解包放入用户目录即可复现；含个人数据的原版样本未公开，仅在本地留存）
 
 ## 提交信息（建议）
 
