@@ -8,21 +8,18 @@
 
 ---
 
-## 摘要（请先读这段）
+## 摘要
 
-**一句话**：一个损坏的 userdb 四个月无人修复、且每次打开都刷错——因为 librime 的自动恢复只挂在"**会话挂载方案词典**"这一条路径上（`UserDictionary::Load()`），而这个 db 恰好是"**从不挂载、仅被依赖组件打开**"的类型。当前行为是"**既不修、也不安静**"的最坏组合：数据不可用、日志被灌满、用户无感知。
+librime 的自动恢复只挂在"会话挂载方案词典"（`UserDictionary::Load()`）这一条路径上。当 db 从不挂载、只被依赖组件打开时，恢复永远不会触发，日志会不断刷错。
 
-**为什么现有的自动恢复救不了它**（本案例的量化事实）：
+本案例：`moran_pin.userdb` 损坏于 2026-06-04。它不在 schema_list 里，只被 moran_fixed/moran_aux 的 lua 组件打开，每个会话失败 3 次、刷 3 条 ERROR，单日累计 237 条，四个月没触发过一次修复。
 
-- `moran_pin.userdb` 损坏于 2026-06-04；此后每个会话固定 3 次 Open 失败（多窗口多会话，单日累计 237 条 ERROR，按线程/时间分布实证），修复从未触发；
-- 恢复接线本身是活的，但只在 `UserDictionary::Load()` 生效，且带 `!deployer.IsWorking()` 门控；
-- `moran_pin` **不在 schema_list**（用户当前方案为 moran/moran_fixed/moran_sentence/moran_aux/tiger），仅作为 moran_fixed/moran_aux 的 lua 模块依赖被打开（每会话 3 次）——这条路径不经过 `UserDictionary::Load`，恢复永远够不着。
+修复方式应当二选一：
 
-**应当二选一，而不是维持现状**：
+- **方案 A（本 PR）**：`Open()` 失败且 `IsCorruption()` 时自动 RepairDB 修复并重试。db 层生效，覆盖所有调用方，数据能救回，日志只剩一条 WARNING；
+- **方案 B**：不修，但每个会话只报一次错（或静默跳过）。数据仍然不可用。
 
-- **方案 A（本 PR）**：打开失败且 `IsCorruption()` 时自动尝试修复（调用现成的 `Recover()`/RepairDB 并重试）——db 层修复，覆盖**所有**调用方与路径，数据尽量保留，日志从每会话数百条 ERROR 变为一条 WARNING；
-- **方案 B（保守下限）**：不自动修，但也不许刷错——失败后按会话去重只报一次（或静默标记该 db 不可用）。代价是该词典数据持续不可用且用户无提示；
-- A 能同时达成 B 的目标并救回数据；B 单独做则只是把问题埋起来。二者取其一或 A+B 组合均可，**唯独现状不可接受**。本 PR 实现 A，供维护者选择/调整。
+现状（反复重试 + 反复刷错）不可接受。本 PR 实现的是 A。
 
 ---
 
@@ -56,8 +53,8 @@ E20261029 18:05:02.xxx 16208 level_db.cc:259] Error opening db 'moran_pin': Corr
 ## 根因
 
 1. LevelDB 打开序列 = 写新 MANIFEST →（新建 log）→ 原子改写 CURRENT。中断窗口落在最后一步时，CURRENT 指向已被清理删除的旧 MANIFEST，此后每次 Open 必然失败；
-2. **自动修复接线存在，但覆盖不到本案例**：`UserDictionary::Load()`（`user_dictionary.cc:171`）在 `db_->Open()` 失败后会调度 `userdb_recovery_task`（内部走 `Recover()`/`RepairDB`，失败还会改名重建 + 快照还原）。但该接线只在"**会话挂载方案词典**"这一条路径上生效，且带 `!deployer.IsWorking()` 门控（维护工作线程运行期间不调度）。本案例中 `moran_pin` **不在 schema_list 中**（用户当前方案为 moran/moran_fixed/moran_sentence/moran_aux/tiger），它只以 lua 模块依赖的形态存在（moran_fixed/moran_aux 引用 `moran_pin*panacea_translator` 等 lua 组件，其内部打开 moran_pin.userdb）——这条开库路径**不经过 `UserDictionary::Load`**，因此每会话固定失败 3 次（多会话累计 237 次/日，已按线程与时间分布实证），却永远不会触发恢复调度；
-3. `LevelDb::Open()` 失败路径本身只刷一行 ERROR 就放弃，于是形成"每次都重试、每次都失败、每次都刷 ERROR"的状态：日志被灌满，用户无感知，数据持续不可用。**本 PR 把自动恢复下沉到 `LevelDb::Open` 层，覆盖一切调用方与调用路径**，正是补上这一缺口。
+2. 自动恢复接线只在 `UserDictionary::Load()`（`user_dictionary.cc:171`）生效：`Open()` 失败后调度 `userdb_recovery_task`（走 `Recover()`/`RepairDB`），且维护线程运行期间跳过。moran_pin 不在 schema_list，只被 moran_fixed/moran_aux 的 lua 组件（`moran_pin*panacea_translator` 等）打开，走不到这条路径，所以失败 3 次/会话，恢复 0 次；
+3. `LevelDb::Open()` 失败只刷一行 ERROR，下个会话再试再刷。本 PR 把修复下沉到 `LevelDb::Open` 层，任何调用方都能触发。
 
 ## 改动（+47/-0）
 
@@ -89,7 +86,7 @@ E20261029 18:05:02.xxx 16208 level_db.cc:259] Error opening db 'moran_pin': Corr
 
 ## 希望维护者关注的几个发现（开放问题）
 
-1. **恢复接线只覆盖会话挂载路径**：`userdb_recovery_task` 由 `UserDictionary::Load()` 触发（并非无人调用，但它要求方案在会话中被挂载，且 `!deployer.IsWorking()` 期间跳过）。对"仅作为依赖/lua 模块被打开、从不挂载"的 userdb（如本案例的 moran_pin），现有接线永远够不着。本 PR 的 Open 层修复补上这一缺口；`UserDbRecoveryTask` 的后续接线策略（如维护期全量巡检）留待讨论；
+1. **恢复接线只覆盖会话挂载路径**：`userdb_recovery_task` 由 `UserDictionary::Load()` 触发，不挂载的 userdb（如本案例的 moran_pin）够不着。本 PR 在 Open 层补上缺口；要不要再加维护期全量巡检，留待讨论；
 2. **`LevelDb` 没有任何 `RIME_DLL` 导出标注**（对比 `TextDb` 全量标注）：Windows 上无法直接实例化测试。尝试对齐 TextDb 风格逐方法标注后，MinGW 链接仍失败——`LevelDb` 多继承 `Recoverable`/`Transactional`，按方法 dllexport 导不出 secondary-base 的 `non-virtual thunk`（`non-virtual thunk to rime::LevelDb::Recover()` 等 undefined reference）；`TextDb` 能直接实例化是因为它单继承。本 PR 的测试因此走组件 + 虚调用（头文件零改动）。若希望 LevelDb 可直接实例化测试，可能需要类级导出或对 `UserDbWrapper<LevelDb>` 显式实例化导出，请维护者定夺；
 3. **`DestroyDB` 不递归删除 `lost/` 子目录**：RepairDB 会把无法归档的旧文件移入 `lost/`，导致 `LevelDb::Remove()` 对修复过的库失效（目录残留、`Exists()` 仍为 true）。测试 fixture 因此用 `std::filesystem::remove_all`；生产路径中 `Remove()` 的调用方是否受影响，值得留意；
 4. **缺 CURRENT 的场景 leveldb 1.23 会自愈**：实测删除 CURRENT 后 `Open()` 成功且数据可读（压力测试日志可证）；真正无法自愈的正是本 PR 针对的"CURRENT 悬空指向不存在文件"这一更糟的状态；
