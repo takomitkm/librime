@@ -38,8 +38,8 @@ E20261029 18:05:02.xxx 16208 level_db.cc:259] Error opening db 'moran_pin': Corr
 ## 根因
 
 1. LevelDB 打开序列 = 写新 MANIFEST →（新建 log）→ 原子改写 CURRENT。中断窗口落在最后一步时，CURRENT 指向已被清理删除的旧 MANIFEST，此后每次 Open 必然失败；
-2. `LevelDb::Recover()`（调 `leveldb::RepairDB`）与 `UserDbRecoveryTask`（修复失败还会改名重建 + 从快照还原）**机制都在，但处于死代码状态**：`userdb_recovery_task` 组件注册于 `dict_module.cc`，全工程没有任何 `RunTask` 调用点，仅废弃的 `RimeRunTask` 外部 API 可达；`LevelDb::Open()` 失败路径只刷一行 ERROR 就放弃；
-3. 于是形成"每次都重试、每次都失败、每次都刷 ERROR"的状态：日志被灌满，用户无感知，数据持续不可用。
+2. **自动修复接线存在，但覆盖不到本案例**：`UserDictionary::Load()`（`user_dictionary.cc:171`）在 `db_->Open()` 失败后会调度 `userdb_recovery_task`（内部走 `Recover()`/`RepairDB`，失败还会改名重建 + 快照还原）。但该接线只在"**会话挂载方案词典**"这一条路径上生效，且带 `!deployer.IsWorking()` 门控（维护工作线程运行期间不调度）。本案例中 `moran_pin` **不在 schema_list 中**（用户当前方案为 moran/moran_fixed/moran_sentence/moran_aux/tiger），它只以 lua 模块依赖的形态存在（moran_fixed/moran_aux 引用 `moran_pin*panacea_translator` 等 lua 组件，其内部打开 moran_pin.userdb）——这条开库路径**不经过 `UserDictionary::Load`**，因此每会话固定失败 3 次（多会话累计 237 次/日，已按线程与时间分布实证），却永远不会触发恢复调度；
+3. `LevelDb::Open()` 失败路径本身只刷一行 ERROR 就放弃，于是形成"每次都重试、每次都失败、每次都刷 ERROR"的状态：日志被灌满，用户无感知，数据持续不可用。**本 PR 把自动恢复下沉到 `LevelDb::Open` 层，覆盖一切调用方与调用路径**，正是补上这一缺口。
 
 ## 改动（+47/-0）
 
@@ -71,7 +71,7 @@ E20261029 18:05:02.xxx 16208 level_db.cc:259] Error opening db 'moran_pin': Corr
 
 ## 希望维护者关注的几个发现（开放问题）
 
-1. **`userdb_recovery_task` 是死代码**：注册于 `dict_module.cc:42`，全工程无 `RunTask("userdb_recovery_task", ...)` 调用点，仅 `RimeRunTask`（deprecated）可达。是否值得在维护/部署流程中接线？本 PR 刻意不越权处理，只做 Open 层最小修复；
+1. **恢复接线只覆盖会话挂载路径**：`userdb_recovery_task` 由 `UserDictionary::Load()` 触发（并非无人调用，但它要求方案在会话中被挂载，且 `!deployer.IsWorking()` 期间跳过）。对"仅作为依赖/lua 模块被打开、从不挂载"的 userdb（如本案例的 moran_pin），现有接线永远够不着。本 PR 的 Open 层修复补上这一缺口；`UserDbRecoveryTask` 的后续接线策略（如维护期全量巡检）留待讨论；
 2. **`LevelDb` 没有任何 `RIME_DLL` 导出标注**（对比 `TextDb` 全量标注）：Windows 上无法直接实例化测试。尝试对齐 TextDb 风格逐方法标注后，MinGW 链接仍失败——`LevelDb` 多继承 `Recoverable`/`Transactional`，按方法 dllexport 导不出 secondary-base 的 `non-virtual thunk`（`non-virtual thunk to rime::LevelDb::Recover()` 等 undefined reference）；`TextDb` 能直接实例化是因为它单继承。本 PR 的测试因此走组件 + 虚调用（头文件零改动）。若希望 LevelDb 可直接实例化测试，可能需要类级导出或对 `UserDbWrapper<LevelDb>` 显式实例化导出，请维护者定夺；
 3. **`DestroyDB` 不递归删除 `lost/` 子目录**：RepairDB 会把无法归档的旧文件移入 `lost/`，导致 `LevelDb::Remove()` 对修复过的库失效（目录残留、`Exists()` 仍为 true）。测试 fixture 因此用 `std::filesystem::remove_all`；生产路径中 `Remove()` 的调用方是否受影响，值得留意；
 4. **缺 CURRENT 的场景 leveldb 1.23 会自愈**：实测删除 CURRENT 后 `Open()` 成功且数据可读（压力测试日志可证）；真正无法自愈的正是本 PR 针对的"CURRENT 悬空指向不存在文件"这一更糟的状态；
